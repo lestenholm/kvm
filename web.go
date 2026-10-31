@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"io/fs"
 	"net"
@@ -239,6 +241,11 @@ func setupRouter() *gin.Engine {
 		// In stateless mode the MCP handler answers GET and DELETE itself.
 		api.Any("/mcp", handleMCP)
 	}
+
+	// Screenshot endpoints: for headless/API consumers (CI, HIL rigs), not the
+	// browser UI, so they use apiAuthMiddleware rather than cookie auth.
+	r.GET("/screenshot.jpg", apiAuthMiddleware(), handleVideoSnapshot)
+	r.GET("/screenshot.png", apiAuthMiddleware(), handleScreenshotPNG)
 
 	// Catch-all route for SPA
 	r.NoRoute(func(c *gin.Context) {
@@ -976,6 +983,45 @@ func handleVideoSnapshot(c *gin.Context) {
 
 	c.Header("Cache-Control", "no-store")
 	c.Data(http.StatusOK, "image/jpeg", jpeg)
+}
+
+func handleScreenshotPNG(c *gin.Context) {
+	opts := native.SnapshotOptions{Quality: native.DefaultSnapshotQuality}
+	jpegBytes, err := takeVideoSnapshot(opts)
+	var noSignal errNoVideoSignal
+	switch {
+	case errors.As(err, &noSignal):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error(), "reason": noSignal.reason})
+		return
+	case errors.Is(err, errVideoPaused), errors.Is(err, native.ErrVideoNotStreaming):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	case errors.Is(err, native.ErrSnapshotTimeout):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timed out waiting for a video frame"})
+		return
+	case errors.Is(err, native.ErrSnapshotInvalid):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the region is outside the video or too small to scale this far"})
+		return
+	case err != nil:
+		logger.Warn().Err(err).Msg("failed to take video snapshot")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to take video snapshot"})
+		return
+	}
+
+	img, err := jpeg.Decode(bytes.NewReader(jpegBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decode captured frame"})
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode PNG"})
+		return
+	}
+
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "image/png", buf.Bytes())
 }
 
 func handleDiagnosticsDownload(c *gin.Context) {
